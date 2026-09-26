@@ -14,10 +14,16 @@ load_dotenv()
 # ================== ENV ==================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Render automatically provides RENDER_EXTERNAL_URL (e.g., https://your-app.onrender.com)
-WEB_HOST = os.getenv("RENDER_EXTERNAL_URL", "")
+
+# Формируем и проверяем внешний URL
+raw_host = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+if raw_host and not raw_host.startswith("http"):
+    WEB_HOST = f"https://{raw_host}"
+else:
+    WEB_HOST = raw_host
+
 WEBHOOK_PATH = f"/webhook/{TELEGRAM_TOKEN}"
-WEBHOOK_URL = f"{WEB_HOST}{WEBHOOK_PATH}"
+WEBHOOK_URL = f"{WEB_HOST}{WEBHOOK_PATH}" if WEB_HOST else ""
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -79,48 +85,52 @@ async def handle_message(message: Message):
 
     chat_histories[chat_id].append({"role": "user", "content": text})
 
-    # Keep system prompt + last 14 messages (Llama 3.3 70B easily handles large histories)
+    # Сохраняем системный промпт + последние 14 сообщений
     if len(chat_histories[chat_id]) > 15:
         chat_histories[chat_id] = [chat_histories[chat_id][0]] + chat_histories[chat_id][-14:]
 
     try:
-        # Flagship model: llama-3.3-70b-versatile
         response = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=chat_histories[chat_id],
-            temperature=0.8,  # Slightly higher for sharper wit & sarcasm
+            temperature=0.8,
             max_tokens=200,
         )
 
         answer = response.choices[0].message.content
         if not answer:
-            raise ValueError("Empty response")
+            raise ValueError("Пустой ответ от Groq")
 
         chat_histories[chat_id].append({"role": "assistant", "content": answer})
         await message.reply(answer)
 
     except Exception as e:
-        logger.error(f"Error handling message: {e}")
+        logger.error(f"Ошибка при обработке сообщения: {e}")
         await message.reply("Даже я иногда молчу.")
     finally:
         user_locks[chat_id] = False
 
 
-# ================== FASTAPI LIFESPAN (WEBHOOK REGISTRATION) ==================
+# ================== FASTAPI LIFESPAN ==================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if WEB_HOST:
-        logger.info(f"Setting webhook to {WEBHOOK_URL}")
+        logger.info(f"Регистрация Webhook в Telegram: {WEBHOOK_URL}")
         await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    else:
+        logger.warning("ВНИМАНИЕ: RENDER_EXTERNAL_URL не задан! Webhook не зарегистрирован автоматически.")
+    
     yield
-    logger.info("Removing webhook...")
-    await bot.delete_webhook()
+    
+    # Мы НЕ делаем delete_webhook() при завершении, чтобы при перезапуске сервера
+    # Telegram не сбрасывал привязку URL.
+
 
 app = FastAPI(lifespan=lifespan)
 
 # ================== WEB ROUTES ==================
 
-# 1. Pinger Endpoint for UptimeRobot (supports both GET and HEAD)
+# 1. Pinger Endpoint (для UptimeRobot)
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "ok", "service": "Smiling Demon Bot"}
@@ -133,12 +143,12 @@ async def bot_webhook(request: Request):
     await dp.feed_update(bot, update)
     return {"status": "ok"}
 
-# 3. Simple Modern Landing Page
+# 3. Landing Page
 @app.get("/", response_class=HTMLResponse)
 async def landing_page():
     return """
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="ru">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -163,52 +173,18 @@ async def landing_page():
         <div class="card">
             <div class="avatar">😈</div>
             <h1>Smiling Demon</h1>
-            <p class="subtitle">Sarcastic, witty, and unapologetic AI assistant.</p>
+            <p class="subtitle">Саркастичный и язвительный ИИ-помощник.</p>
 
             <div class="features">
-                <div class="feature-item"><span>⚡</span> Powered by Llama 3.3 70B (Groq LPU)</div>
-                <div class="feature-item"><span>💬</span> Works in Direct Messages & Telegram Groups</div>
-                <div class="feature-item"><span>🧠</span> Expanded conversation context length</div>
-                <div class="feature-item"><span>🎯</span> Fast responses via Telegram Webhooks</div>
+                <div class="feature-item"><span>⚡</span> Работает на Llama 3.3 70B (Groq LPU)</div>
+                <div class="feature-item"><span>💬</span> Поддерживает личные сообщения и группы Telegram</div>
+                <div class="feature-item"><span>🧠</span> Память диалога в реальном времени</div>
+                <div class="feature-item"><span>🎯</span> Мгновенный отклик через Webhook</div>
             </div>
 
-            <a href="https://t.me/YourBotUsername" class="btn" target="_blank">Chat on Telegram</a>
+            <a href="https://t.me/YourBotUsername" class="btn" target="_blank">Открыть в Telegram</a>
             <div class="status-badge">● Bot Online</div>
         </div>
     </body>
     </html>
     """
-# ================== .env ==================
-# TELEGRAM_TOKEN=твой_токен
-# GROQ_API_KEY=твой_ключ
-
-
-# ================== ИНСТРУКЦИЯ ==================
-# 1. Получи ключ: https://console.groq.com/
-# 2. Создай .env файл
-# 3. Установи зависимости:
-#    pip install -r requirements.txt
-# 4. Запусти:
-#    python bot.py
-
-
-# ================== ОГРАНИЧЕНИЯ ==================
-# - модель: llama-3.1-70b-versatile
-# - бесплатные лимиты Groq (достаточно большие)
-# - max_tokens ограничен
-# - история урезается
-
-
-# ================== ПЛЮСЫ ==================
-# - бесплатно
-# - очень быстро
-# - стабильнее g4f
-
-
-# ================== МИНУСЫ ==================
-# - иногда хуже держит стиль, чем OpenAI
-# - может чуть "плыть" характер
-
-
-# ================== СОВЕТ ==================
-# если начнёт тупеть — уменьши историю до 6 сообщений 😏
