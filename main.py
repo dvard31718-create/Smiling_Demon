@@ -15,7 +15,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Формируем и проверяем внешний URL
+# Автоматически определяем адрес Render
 raw_host = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 if raw_host and not raw_host.startswith("http"):
     WEB_HOST = f"https://{raw_host}"
@@ -46,6 +46,7 @@ SYSTEM_PROMPT = (
 # ================== BOT HANDLERS ==================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    logger.info(f"Получена команда /start от {message.from_user.id}")
     chat_histories[message.chat.id] = [{"role": "system", "content": SYSTEM_PROMPT}]
     await message.answer("Smiling Demon здесь. Постарайся не тратить моё время.")
 
@@ -55,6 +56,7 @@ async def handle_message(message: Message):
         return
 
     chat_id = message.chat.id
+    logger.info(f"Получено сообщение из чата {chat_id}: {message.text[:20]}...")
 
     if user_locks.get(chat_id):
         await message.reply("Терпение. Я уже думаю.")
@@ -85,7 +87,6 @@ async def handle_message(message: Message):
 
     chat_histories[chat_id].append({"role": "user", "content": text})
 
-    # Сохраняем системный промпт + последние 14 сообщений
     if len(chat_histories[chat_id]) > 15:
         chat_histories[chat_id] = [chat_histories[chat_id][0]] + chat_histories[chat_id][-14:]
 
@@ -105,7 +106,7 @@ async def handle_message(message: Message):
         await message.reply(answer)
 
     except Exception as e:
-        logger.error(f"Ошибка при обработке сообщения: {e}")
+        logger.error(f"Ошибка при работе с Groq: {e}", exc_info=True)
         await message.reply("Даже я иногда молчу.")
     finally:
         user_locks[chat_id] = False
@@ -114,36 +115,42 @@ async def handle_message(message: Message):
 # ================== FASTAPI LIFESPAN ==================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("=== ЗАПУСК ПРИЛОЖЕНИЯ ===")
     if WEB_HOST:
-        logger.info(f"Регистрация Webhook в Telegram: {WEBHOOK_URL}")
-        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        try:
+            logger.info(f"Попытка установить Webhook в Telegram: {WEBHOOK_URL}")
+            res = await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+            logger.info(f"Результат установки Webhook: {res}")
+        except Exception as e:
+            logger.error(f"ОШИБКА установки Webhook: {e}")
     else:
-        logger.warning("ВНИМАНИЕ: RENDER_EXTERNAL_URL не задан! Webhook не зарегистрирован автоматически.")
+        logger.error("КРИТИЧЕСКАЯ ОШИБКА: Переменная RENDER_EXTERNAL_URL пуста! Webhook НЕ установлен.")
     
     yield
-    
-    # Мы НЕ делаем delete_webhook() при завершении, чтобы при перезапуске сервера
-    # Telegram не сбрасывал привязку URL.
+    logger.info("=== ОСТАНОВКА ПРИЛОЖЕНИЯ ===")
 
 
 app = FastAPI(lifespan=lifespan)
 
 # ================== WEB ROUTES ==================
 
-# 1. Pinger Endpoint (для UptimeRobot)
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "ok", "service": "Smiling Demon Bot"}
 
-# 2. Telegram Webhook Receiver
+# Прием сообщений от Telegram
 @app.post(WEBHOOK_PATH)
 async def bot_webhook(request: Request):
-    data = await request.json()
-    update = types.Update.model_validate(data, context={"bot": bot})
-    await dp.feed_update(bot, update)
+    try:
+        data = await request.json()
+        update = types.Update.model_validate(data, context={"bot": bot})
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке webhook запроса: {e}", exc_info=True)
+    
+    # Всегда возвращаем 200 OK для Telegram, чтобы он не заблокировал вебхук
     return {"status": "ok"}
 
-# 3. Landing Page
 @app.get("/", response_class=HTMLResponse)
 async def landing_page():
     return """
