@@ -79,15 +79,17 @@ async def handle_message(message: Message):
 
     chat_histories[chat_id].append({"role": "user", "content": text})
 
-    if len(chat_histories[chat_id]) > 11:
-        chat_histories[chat_id] = [chat_histories[chat_id][0]] + chat_histories[chat_id][-10:]
+    # Keep system prompt + last 14 messages (Llama 3.3 70B easily handles large histories)
+    if len(chat_histories[chat_id]) > 15:
+        chat_histories[chat_id] = [chat_histories[chat_id][0]] + chat_histories[chat_id][-14:]
 
     try:
+        # Flagship model: llama-3.3-70b-versatile
         response = await client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="llama-3.3-70b-versatile",
             messages=chat_histories[chat_id],
-            temperature=0.7,
-            max_tokens=150,
+            temperature=0.8,  # Slightly higher for sharper wit & sarcasm
+            max_tokens=200,
         )
 
         answer = response.choices[0].message.content
@@ -118,10 +120,11 @@ app = FastAPI(lifespan=lifespan)
 
 # ================== WEB ROUTES ==================
 
+# 1. Pinger Endpoint for UptimeRobot (supports both GET and HEAD)
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "ok", "service": "Smiling Demon Bot"}
-    
+
 # 2. Telegram Webhook Receiver
 @app.post(WEBHOOK_PATH)
 async def bot_webhook(request: Request):
@@ -163,9 +166,9 @@ async def landing_page():
             <p class="subtitle">Sarcastic, witty, and unapologetic AI assistant.</p>
 
             <div class="features">
-                <div class="feature-item"><span>⚡</span> Powered by Llama 3.1 & Groq API</div>
+                <div class="feature-item"><span>⚡</span> Powered by Llama 3.3 70B (Groq LPU)</div>
                 <div class="feature-item"><span>💬</span> Works in Direct Messages & Telegram Groups</div>
-                <div class="feature-item"><span>🧠</span> Keeps short memory of recent context</div>
+                <div class="feature-item"><span>🧠</span> Expanded conversation context length</div>
                 <div class="feature-item"><span>🎯</span> Fast responses via Telegram Webhooks</div>
             </div>
 
@@ -175,8 +178,6 @@ async def landing_page():
     </body>
     </html>
     """
-
-
 # ================== .env ==================
 # TELEGRAM_TOKEN=твой_токен
 # GROQ_API_KEY=твой_ключ
