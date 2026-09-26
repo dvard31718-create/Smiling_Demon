@@ -11,11 +11,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ================== ENV ==================
+# ================== ENV CONFIGURATION ==================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Автоматически определяем адрес Render
+# Extract and validate base URL from Render
 raw_host = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 if raw_host and not raw_host.startswith("http"):
     WEB_HOST = f"https://{raw_host}"
@@ -28,10 +28,17 @@ WEBHOOK_URL = f"{WEB_HOST}{WEBHOOK_PATH}" if WEB_HOST else ""
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ================== BOT & GROQ SETUP ==================
+# ================== SETUP & INITIALIZATION ==================
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 client = AsyncGroq(api_key=GROQ_API_KEY)
+
+# Priority list of models to try sequentially if limits are exceeded
+FALLBACK_MODELS = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b",
+]
 
 chat_histories = {}
 user_locks = {}
@@ -46,7 +53,7 @@ SYSTEM_PROMPT = (
 # ================== BOT HANDLERS ==================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    logger.info(f"Получена команда /start от {message.from_user.id}")
+    logger.info(f"Received /start from user ID: {message.from_user.id}")
     chat_histories[message.chat.id] = [{"role": "system", "content": SYSTEM_PROMPT}]
     await message.answer("Smiling Demon здесь. Постарайся не тратить моё время.")
 
@@ -56,7 +63,7 @@ async def handle_message(message: Message):
         return
 
     chat_id = message.chat.id
-    logger.info(f"Получено сообщение из чата {chat_id}: {message.text[:20]}...")
+    logger.info(f"Incoming message from chat {chat_id}: {message.text[:30]}...")
 
     if user_locks.get(chat_id):
         await message.reply("Терпение. Я уже думаю.")
@@ -64,50 +71,62 @@ async def handle_message(message: Message):
 
     user_locks[chat_id] = True
 
-    bot_user = await bot.me()
-    bot_username = bot_user.username
-
-    if message.chat.type in ["group", "supergroup"]:
-        if (
-            f"@{bot_username}" not in message.text
-            and (
-                not message.reply_to_message
-                or message.reply_to_message.from_user.id != bot_user.id
-            )
-        ):
-            user_locks[chat_id] = False
-            return
-
-        text = message.text.replace(f"@{bot_username}", "").strip()
-    else:
-        text = message.text
-
-    if chat_id not in chat_histories:
-        chat_histories[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    chat_histories[chat_id].append({"role": "user", "content": text})
-
-    if len(chat_histories[chat_id]) > 15:
-        chat_histories[chat_id] = [chat_histories[chat_id][0]] + chat_histories[chat_id][-14:]
-
     try:
-        response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=chat_histories[chat_id],
-            temperature=0.8,
-            max_tokens=200,
-        )
+        bot_user = await bot.me()
+        bot_username = bot_user.username
 
-        answer = response.choices[0].message.content
-        if not answer:
-            raise ValueError("Пустой ответ от Groq")
+        # Filter messages in group chats
+        if message.chat.type in ["group", "supergroup"]:
+            if (
+                f"@{bot_username}" not in message.text
+                and (
+                    not message.reply_to_message
+                    or message.reply_to_message.from_user.id != bot_user.id
+                )
+            ):
+                return
 
-        chat_histories[chat_id].append({"role": "assistant", "content": answer})
-        await message.reply(answer)
+            text = message.text.replace(f"@{bot_username}", "").strip()
+        else:
+            text = message.text
 
-    except Exception as e:
-        logger.error(f"Ошибка при работе с Groq: {e}", exc_info=True)
-        await message.reply("Даже я иногда молчу.")
+        if chat_id not in chat_histories:
+            chat_histories[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        chat_histories[chat_id].append({"role": "user", "content": text})
+
+        # Keep system prompt + last 14 turns
+        if len(chat_histories[chat_id]) > 15:
+            chat_histories[chat_id] = [chat_histories[chat_id][0]] + chat_histories[chat_id][-14:]
+
+        answer = None
+
+        # Sequential model fallback loop
+        for model in FALLBACK_MODELS:
+            try:
+                logger.info(f"Requesting completion using model: {model}")
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=chat_histories[chat_id],
+                    temperature=0.8,
+                    max_tokens=200,
+                )
+
+                candidate_answer = response.choices[0].message.content
+                if candidate_answer:
+                    answer = candidate_answer
+                    logger.info(f"Successfully generated response with model: {model}")
+                    break
+            except Exception as e:
+                logger.warning(f"Model {model} failed: {e}. Attempting fallback...")
+
+        if answer:
+            chat_histories[chat_id].append({"role": "assistant", "content": answer})
+            await message.reply(answer)
+        else:
+            logger.error("All fallback models failed to return a response.")
+            await message.reply("Даже я иногда молчу.")
+
     finally:
         user_locks[chat_id] = False
 
@@ -115,30 +134,28 @@ async def handle_message(message: Message):
 # ================== FASTAPI LIFESPAN ==================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("=== ЗАПУСК ПРИЛОЖЕНИЯ ===")
+    logger.info("=== STARTING SERVER ===")
     if WEB_HOST:
         try:
-            logger.info(f"Попытка установить Webhook в Telegram: {WEBHOOK_URL}")
+            logger.info(f"Setting webhook URL to: {WEBHOOK_URL}")
             res = await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-            logger.info(f"Результат установки Webhook: {res}")
+            logger.info(f"Webhook setting response: {res}")
         except Exception as e:
-            logger.error(f"ОШИБКА установки Webhook: {e}")
+            logger.error(f"Failed to set webhook on startup: {e}")
     else:
-        logger.error("КРИТИЧЕСКАЯ ОШИБКА: Переменная RENDER_EXTERNAL_URL пуста! Webhook НЕ установлен.")
+        logger.error("RENDER_EXTERNAL_URL is not set! Webhook could not be auto-configured.")
     
     yield
-    logger.info("=== ОСТАНОВКА ПРИЛОЖЕНИЯ ===")
+    logger.info("=== SHUTTING DOWN SERVER ===")
 
 
 app = FastAPI(lifespan=lifespan)
 
 # ================== WEB ROUTES ==================
-
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "ok", "service": "Smiling Demon Bot"}
 
-# Прием сообщений от Telegram
 @app.post(WEBHOOK_PATH)
 async def bot_webhook(request: Request):
     try:
@@ -146,9 +163,9 @@ async def bot_webhook(request: Request):
         update = types.Update.model_validate(data, context={"bot": bot})
         await dp.feed_update(bot, update)
     except Exception as e:
-        logger.error(f"Ошибка при обработке webhook запроса: {e}", exc_info=True)
+        logger.error(f"Error handling update in webhook: {e}", exc_info=True)
     
-    # Всегда возвращаем 200 OK для Telegram, чтобы он не заблокировал вебхук
+    # Always return HTTP 200 OK so Telegram keeps the webhook active
     return {"status": "ok"}
 
 @app.get("/", response_class=HTMLResponse)
@@ -183,13 +200,13 @@ async def landing_page():
             <p class="subtitle">Саркастичный и язвительный ИИ-помощник.</p>
 
             <div class="features">
-                <div class="feature-item"><span>⚡</span> Работает на Llama 3.3 70B (Groq LPU)</div>
-                <div class="feature-item"><span>💬</span> Поддерживает личные сообщения и группы Telegram</div>
+                <div class="feature-item"><span>⚡</span> Автопереключение моделей при лимитах (Fallback)</div>
+                <div class="feature-item"><span>💬</span> Поддержка личных сообщений и групп Telegram</div>
                 <div class="feature-item"><span>🧠</span> Память диалога в реальном времени</div>
                 <div class="feature-item"><span>🎯</span> Мгновенный отклик через Webhook</div>
             </div>
 
-            <a href="https://t.me/YourBotUsername" class="btn" target="_blank">Открыть в Telegram</a>
+            <a href="https://t.me/" class="btn" target="_blank">Открыть в Telegram</a>
             <div class="status-badge">● Bot Online</div>
         </div>
     </body>
