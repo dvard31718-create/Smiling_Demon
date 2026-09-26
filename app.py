@@ -119,9 +119,11 @@ app = FastAPI(lifespan=lifespan)
 # ================== WEB ROUTES ==================
 
 # 1. Pinger Endpoint for UptimeRobot
-@app.get("/healthz")
+
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "ok", "service": "Smiling Demon Bot"}
+    
 
 # 2. Telegram Webhook Receiver
 @app.post(WEBHOOK_PATH)
